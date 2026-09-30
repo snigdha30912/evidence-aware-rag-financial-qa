@@ -105,7 +105,7 @@ Concretely: a question needing total assets and net income, where the corpus res
 
 This mechanism is metric-agnostic - `|Δmetric_ij|` can be any rank metric's sensitivity to a swap. RQ2 substitutes `Δcoverage@k` for the standard `ΔNDCG`. Because `coverage@k` is a set-membership function (a hop is covered iff any of its chunks is in the top-k), swapping two candidates that are both inside, or both outside, the top-k provably cannot change it - only a pair straddling the rank-k boundary can. Concretely: if a hop is already covered by a chunk ranked #2, two of its other restated chunks competing for ranks #15 vs. #16 get `Δcoverage@k = 0` - there's nothing left to gain there, so training gradient is directed elsewhere, toward hops that aren't covered yet. This also makes `Δcoverage@k` exact and cheap to compute, unlike `ΔNDCG`, which is nonzero for essentially every pair and has to be computed per-pair regardless of rank position.
 
-**Training**: implemented from scratch (`sklearn.tree.DecisionTreeRegressor` in a manual gradient-boosting loop - LightGBM/XGBoost require `libomp`, unavailable in this environment, and a custom objective needs gradient control those libraries don't expose). Two choices were necessary to get a result that generalizes:
+**Training**: gradient boosting implemented from scratch. Two choices were necessary to get a result that generalizes:
 - **Warm start**: the ensemble is initialized to the stage-1 fused score, not zero, and learns only a small correction (`max_depth=2`, `min_samples_leaf=25`, `learning_rate=0.05`). An earlier, un-warm-started version with richer features memorized company-specific score patterns from the ~26 available training examples and did not transfer to new companies' filings.
 
 | Feature | Description |
@@ -124,9 +124,13 @@ This mechanism is metric-agnostic - `|Δmetric_ij|` can be any rank metric's sen
 |---|---|---|---|
 | Baseline (stage 1 only) | 0.738 | 0.741 | 0.522 |
 | + cross-encoder (β=1.0) | **0.942 (+27.6%)** | **0.945 (+27.5%)** | **0.842 (+61.3%)** |
-| + query decomposition, multi-metric subset only (n=40)¹ | **0.969 (+20.2%)** | **0.969 (+20.2%)** | **0.856 (+13.8%)** |
 
-¹ Evaluated only on the 40 multi-metric questions in the 185-question set (the subset query decomposition applies to), against that same subset's bundled-query + cross-encoder numbers (recall@10=0.806, coverage@10=0.806, NDCG@10=0.753) - not against the full-set baseline row above, since the two rows use different denominators.
+**Query decomposition, evaluated separately on its own subset** (the 40 multi-metric questions within the 185-question set):
+
+| | Recall@10 | Coverage@10 | NDCG@10 |
+|---|---|---|---|
+| Bundled query + cross-encoder | 0.806 | 0.806 | 0.753 |
+| + query decomposition | **0.969 (+20.2%)** | **0.969 (+20.2%)** | **0.856 (+13.8%)** |
 
 **RQ2** (32-question redundant-hop set, 5-fold cross-validation, out-of-fold):
 
