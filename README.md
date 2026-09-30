@@ -19,19 +19,19 @@ Full technical writeups: [`PROJECT_SUMMARY.md`](PROJECT_SUMMARY.md), [`RQ1_RESUL
 
 ## Dataset
 
-**Corpus**: 146,821 chunks from 84 SEC filings across 32 companies (2015-2024). PDFs are converted to structured markdown via [Docling](https://github.com/docling-project/docling), then split into two chunk types: table **rows** (one row = one chunk, with entity/fiscal-year/section-title metadata attached) and narrative **paragraphs**. Row-level granularity is used for tables because the correct answer is often a single row among dozens of visually similar ones; paragraph-level granularity is used for narrative text because evidence there tends to span multiple sentences. A coarse, whole-table chunking variant was tested directly as the retrieval unit and reduced performance (tables here range from 1 to 66 rows, so a whole-table chunk for a large table is dominated by irrelevant rows) - it is kept only as supplementary lookup data (`data/processed/coarse_chunks.parquet`), not as the retrieval unit.
+**Corpus**: 146,821 chunks from 84 SEC filings across 32 companies (2015-2024). PDFs are converted to structured markdown via [Docling](https://github.com/docling-project/docling), then split into two chunk types: table **rows** (one row = one chunk, with entity/fiscal-year/section-title metadata attached) and narrative **paragraphs**. Row-level granularity is used for tables because the correct answer is often a single row among dozens of visually similar ones; paragraph-level granularity is used for narrative text because evidence there tends to span multiple sentences.
+
+**"Hop" and "hop size"** - two independent properties used to describe a question. A **hop** is one distinct fact the question needs (a question needing revenue and total assets has 2 hops). **Hop size** is how many chunks in the corpus contain that fact - hop size 1 means the fact appears in exactly one place; hop size 2+ means it's restated in more than one chunk (e.g. the same net income figure reported in both an earnings release and the subsequent 10-K). `coverage@k` and `recall@k` are mathematically identical whenever every hop has size 1; they diverge only on redundant-hop questions, which is the subject of RQ2.
 
 **Question types**, with one example each:
 
-| Type | Hops | Example |
-|---|---|---|
-| Single-metric (factual) | 1 | *"What was 3M's revenue in FY2018?"* |
-| Multi-metric (factual, multi-hop) | 2-4, hop size 1 | *"What was 3M's cash and cash equivalents, cost of sales, total current assets and total current liabilities in FY2018?"* |
-| Narrative | 1 | FinanceBench questions whose evidence is prose rather than a table cell |
-| Cross-distribution (analytical) | varies | *"What is the FY2017-FY2019 3-year average of capex as a % of revenue for Activision Blizzard?"* - requires locating multiple raw figures and computing a derived ratio |
-| Redundant-hop | 2+, hop size 2+ | Same shape as multi-metric, but at least one fact is restated in more than one chunk (e.g. an earnings release and the subsequent 10-K both reporting the same net income figure) |
-
-**"Hop" vs. "hop size"** - two independent properties. Hop count is how many distinct facts a question needs. Hop size is how many chunks satisfy any single one of those facts. `coverage@k` and `recall@k` are mathematically identical whenever every hop has size 1; they diverge only on redundant-hop questions, which is the subject of RQ2.
+| Type | Hops | Hop size | Example |
+|---|---|---|---|
+| Single-metric (factual) | 1 | 1 | *"What was 3M's revenue in FY2018?"* |
+| Multi-metric (factual, multi-hop) | 2-4 | 1 | *"What was 3M's cash and cash equivalents, cost of sales, total current assets and total current liabilities in FY2018?"* |
+| Narrative | 1 | 1 | FinanceBench questions whose evidence is prose rather than a table cell |
+| Cross-distribution (analytical) | varies | 1 | *"What is the FY2017-FY2019 3-year average of capex as a % of revenue for Activision Blizzard?"* - requires locating multiple raw figures and computing a derived ratio |
+| Redundant-hop | 2+ | 2+ | Same shape as multi-metric, but at least one fact is restated in more than one chunk (e.g. an earnings release and the subsequent 10-K both reporting the same net income figure) |
 
 **Test sets used below**: a 591-question training set and a 185-question held-out set (built from 7 metrics never used in training, for a same-distribution generalization check) for RQ1; a 32-question redundant-hop set (mined from the corpus, verified by exact numeric-value matching) for RQ2; natural FinanceBench train/val splits for cross-distribution generalization checks.
 
