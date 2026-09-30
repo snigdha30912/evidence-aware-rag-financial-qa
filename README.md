@@ -1,92 +1,146 @@
 # Evidence-Aware RAG for Multi-Hop Financial QA
 
-## The problem, with a real example
+Retrieval-augmented QA over SEC filings (10-K, 10-Q, 8-K, earnings releases), built on [FinanceBench](https://arxiv.org/abs/2311.11944). Two properties of this domain make standard RAG retrieval fail in specific, measurable ways:
 
-Imagine you ask a system: *"What was 3M's cash and cash equivalents, cost of sales, total current assets and total current liabilities in FY2018?"*
+1. **Table precision**: financial evidence lives in tables where the correct row and an incorrect row can differ by a single word or a sign convention (e.g. "Net income" vs. "Net income attributable to noncontrolling interest").
+2. **Multi-hop, redundant evidence**: many questions require several distinct facts, and a given fact is sometimes restated in more than one place in the corpus (e.g. an earnings release and the subsequent 10-K reporting the same figure).
 
-To answer this, the system has to find four separate numbers, scattered across different tables in a 200-page SEC filing. We tried this with a standard search setup (the kind most "search your PDFs" tools use), and it completely failed to find one of the four numbers - **cash and cash equivalents didn't show up anywhere in the top 100 search results**, even though the exact right table row was sitting right there in the document. When we asked for that one number by itself ("What was 3M's cash and cash equivalents in FY2018?"), the system found it instantly, ranked #1.
+This project investigates two research questions against these properties:
 
-**Why did this happen?** Search systems typically work by matching words in your question to words in the document. When you cram four different topics into one question, the system gets confused about which words matter for which fact, and the search results end up favoring whichever table happens to overlap with the *most* words in the question - not necessarily the table with the *right* answer. We found a fix for this (explained below), and it's one of two real improvements this project made.
+- **RQ1**: does a domain fine-tuned cross-encoder reranker improve retrieval over BM25+dense fusion? Result: **recall@10 0.738 → 0.942 (+27.6%)** on a held-out test set.
+- **RQ2**: can a reranker be trained to explicitly maximize *coverage* of distinct required facts, rather than raw relevance, for multi-hop questions with redundant evidence? Result: **recall@10 0.238 → 0.316 (+32.9%), coverage@10 0.497 → 0.576 (+15.9%)**, on a held-out redundant-hop test set.
 
-The second problem is subtler. Financial filings often repeat the same number in more than one place - a company's revenue might appear once in a table and again in a press release that came out a few months earlier. If your system finds two copies of that revenue number but misses a *different* required fact entirely, standard scoring will say "great, I found most of what you asked for!" - even though it actually failed the question. We built a way to measure and fix this too.
+Full technical writeups: [`PROJECT_SUMMARY.md`](PROJECT_SUMMARY.md), [`RQ1_RESULTS.md`](RQ1_RESULTS.md), [`RQ2_RESULTS.md`](RQ2_RESULTS.md).
 
-This project is about diagnosing problems like these in financial document search, one real example at a time, and testing fixes properly (on data the system has never seen) rather than assuming a fix works.
+## Dataset
 
-## How the system works, in plain terms
+**Corpus**: 146,821 chunks from 84 SEC filings across 32 companies (2015-2024). PDFs are converted to structured markdown via [Docling](https://github.com/docling-project/docling), then split into two chunk types: table **rows** (one row = one chunk, with entity/fiscal-year/section-title metadata attached) and narrative **paragraphs**. Row-level granularity is used for tables because the correct answer is often a single row among dozens of visually similar ones; paragraph-level granularity is used for narrative text because evidence there tends to span multiple sentences. A coarse, whole-table chunking variant was tested directly as the retrieval unit and reduced performance (tables here range from 1 to 66 rows, so a whole-table chunk for a large table is dominated by irrelevant rows) - it is kept only as supplementary lookup data (`data/processed/coarse_chunks.parquet`), not as the retrieval unit.
 
-1. **Search** - given a question, find candidate passages from the filings using two methods at once: keyword matching (like a smarter version of Ctrl+F) and meaning-based matching (which can find a match even if the words don't line up exactly, e.g. "profit" vs "net income"). Combine both into one ranked list.
-2. **Re-rank** - take the top candidates from step 1 and use a more careful (but slower) model to re-score them, one at a time, looking closely at the question *and* the candidate together rather than separately.
-3. **Coverage check** (for multi-fact questions specifically) - a second re-ranking pass that explicitly tries to avoid the "found two copies of one fact, missed another fact entirely" problem described above.
+**Question types**, with one example each:
 
-Everything below is about how well each of these steps actually works, tested on real questions the system never saw during development.
-
-## Research Question 1: Does a more careful "second look" actually help?
-
-**The question in plain terms**: after the first search pass finds ~50 candidate passages, does spending more compute to carefully re-read and re-score each one (the "re-rank" step above) actually make things better, or is it not worth it?
-
-**What we did**: we fine-tuned a small language model specifically to get better at this domain, by showing it real mistakes our own search system was making - not made-up wrong answers, but the *actual* wrong passages the system was ranking highly by mistake. This is the training data a generic, off-the-shelf model wouldn't have.
-
-**Did it work?** Yes, clearly - tested on 185 questions the model never saw during training, built from facts it was never trained on either:
-
-| | Before re-ranking | After re-ranking |
+| Type | Hops | Example |
 |---|---|---|
-| How often the right answer is in the top 10 results | 74% | **94%** |
-| Ranking quality score (0=bad, 1=perfect) | 0.52 | **0.84** |
+| Single-metric (factual) | 1 | *"What was 3M's revenue in FY2018?"* |
+| Multi-metric (factual, multi-hop) | 2-4, hop size 1 | *"What was 3M's cash and cash equivalents, cost of sales, total current assets and total current liabilities in FY2018?"* |
+| Narrative | 1 | FinanceBench questions whose evidence is prose rather than a table cell |
+| Cross-distribution (analytical) | varies | *"What is the FY2017-FY2019 3-year average of capex as a % of revenue for Activision Blizzard?"* - requires locating multiple raw figures and computing a derived ratio |
+| Redundant-hop | 2+, hop size 2+ | Same shape as multi-metric, but at least one fact is restated in more than one chunk (e.g. an earnings release and the subsequent 10-K both reporting the same net income figure) |
 
-**An honest catch we found along the way**: while building this, we once checked a model whose training looked completely normal - the error numbers went down steadily like they're supposed to - but when we actually looked at what it was doing, it was scoring *wrong* answers higher than *right* answers. The training metrics looked fine; the model was actually broken. The lesson: you can't just trust that "the numbers went down," you have to check what the model actually does on real examples. We check this on every model in this project now.
+**"Hop" vs. "hop size"** - two independent properties. Hop count is how many distinct facts a question needs. Hop size is how many chunks satisfy any single one of those facts. `coverage@k` and `recall@k` are mathematically identical whenever every hop has size 1; they diverge only on redundant-hop questions, which is the subject of RQ2.
 
-**Another honest finding**: the re-ranking model works great on questions phrased like a simple fact-lookup ("what was X's revenue"), but when we tested it on real analyst-style questions that require *calculating* something ("what's the 3-year average capex as a percent of revenue"), it sometimes made things *worse* than not re-ranking at all. So we built a dial (called `beta`) for how much to trust the re-ranker, and the honest answer is: trust it fully if your questions look like simple fact lookups, trust it less if they're more analytical.
+**Test sets used below**: a 591-question training set and a 185-question held-out set (built from 7 metrics never used in training, for a same-distribution generalization check) for RQ1; a 32-question redundant-hop set (mined from the corpus, verified by exact numeric-value matching) for RQ2; natural FinanceBench train/val splits for cross-distribution generalization checks.
 
-## Research Question 2: What about the "found two copies of one fact, missed another" problem?
+## Method
 
-**A real example.** A company's FY2023 10-K and their earnings press release (issued a few months earlier) both report the same net income figure. A question asking for 4 different facts about that company might get: 2 copies of net income (one from each document), 0 copies of a different required fact. A standard scoring system sees "4 out of 4 slots are gold chunks" and says great job - but the system actually only found 1 out of the 2 distinct facts needed. It just found the *same one* twice.
+### Stage 1: BM25 + dense fusion (baseline)
 
-**How we measured this properly**: we built a metric that counts *distinct facts found*, not *total correct passages found*. On a set of questions specifically designed to have this repeated-fact problem, the two metrics told very different stories about the exact same search results:
+- Sparse: BM25 (`bm25s`), NLTK's 198-word stopword list, each chunk's text prefixed with `entity, FYyear, section_title:`.
+- Dense: `sentence-transformers/all-mpnet-base-v2` embeddings (off-the-shelf, not fine-tuned), cosine similarity.
+- Entity/year filtering: regex-based company and fiscal-year detection restricts candidates to the detected company/year.
+- Fusion: convex combination of min-max normalized scores, `score = α · bm25_norm + (1-α) · dense_norm`, `α=0.4` (found by sweep; outperforms BM25 alone, dense alone, and reciprocal rank fusion).
 
-| | "Total correct passages found" (standard metric) | "Distinct facts found" (our metric) |
+### Query decomposition for multi-metric questions
+
+Bundling several metric names into one query dilutes BM25/dense term-overlap scoring for each individual metric against the vocabulary of the others also present in the query. Diagnosed directly: for the multi-metric example above, the gold chunk for "cash and cash equivalents" was absent from the top 100 results when bundled with the other three metrics, but ranked #1 when queried alone.
+
+**Fix**: detect the metrics named in a question, split into one single-metric sub-question per metric, retrieve and rerank each independently, and interleave (round-robin, not concatenated) their top results into one combined ranking.
+
+| | Coverage@10 | Recall@10 |
 |---|---|---|
-| Plain search, no re-ranking | 24% | 42% |
+| Bundled query | 0.806 | 0.806 |
+| Decomposed query | **0.969 (+20.2%)** | **0.969 (+20.2%)** |
 
-That's a huge gap on the *same* ranked list - proof that the standard way of measuring "did we find the answer" can be seriously misleading for questions with more than one required fact.
+13/40 questions improved, 27 unchanged, 0 regressed (held-out multi-metric set).
 
-**Did we find a fix?** A modest one. We trained a second re-ranking model specifically taught to notice "this candidate repeats a fact I already have" and prefer a candidate covering a still-missing fact instead. It's a smaller, cheaper model than the one from RQ1 (no expensive fine-tuning needed), and here's what it achieved on questions it never saw during training:
+### Stage 2 (RQ1): cross-encoder reranking
 
-| | Plain search | + our fact-coverage-aware model |
+A cross-encoder (`cross-encoder/ms-marco-MiniLM-L-6-v2`) processes the query and a candidate jointly via self-attention and outputs one relevance score, as opposed to a bi-encoder's separately-computed, distance-compared embeddings. Fine-tuned via **RankNetLoss** (Burges et al., 2005) on domain-informed hard negatives - the pipeline's own top-ranked *incorrect* results, not random negatives.
+
+For a pair (i, j) where i is more relevant than j:
+```
+P_ij = 1 / (1 + exp(-σ(s_i - s_j)))
+L = -log(P_ij)
+```
+Minimizing this pushes the relevant document's score up and the hard negative's down. Trained on 591 questions / 3,682 (question, document) pairs, 5 epochs.
+
+**Score blending**: rather than fully trusting the reranker, its score is blended with the stage-1 rank: `final = β · reranker_score + (1-β) · stage1_rank`. Swept over `β ∈ {0.0, 0.3, 0.5, 0.7, 1.0}`:
+
+| Test set | β=1.0 (full trust) | β=0.3 |
 |---|---|---|
-| Distinct facts found | 42% | **49%** |
+| Held-out, same distribution (185 q) | **+64% P@5** | +40% P@5 |
+| Cross-distribution, natural FinanceBench (30 q) | **-21% P@5 (regression)** | +5% P@5 |
 
-That's a real, honest, modestly-sized improvement (+16%) - not a breakthrough, but genuine and properly tested. We also checked: does a version of this model *without* the fact-coverage-specific training do just as well, using the exact same setup otherwise? No - it actually performed **worse than not re-ranking at all**. That comparison confirms the fact-coverage-specific idea is what's doing the work, not just "any model helps a bit."
+`β=1.0` is optimal for factual-lookup questions but regresses on analytically-phrased questions; `β=0.3` is positive on every test set and is the recommended default when the query distribution is uncertain.
 
-**The fix that mattered more than expected**: remember the opening example, where bundling 4 facts into one question made the search miss one of them entirely? We found that simply **splitting a multi-fact question into separate single-fact questions**, searching for each one individually, and combining the results back together, recovered that missing fact completely - and more broadly, improved how many distinct facts get found by about 20%, with zero cases where it made things worse across 40 test questions. This was a bigger, cleaner win than any of the fancier re-ranking approaches we tried, which is itself a useful lesson: sometimes the simplest fix (ask one question at a time) beats a more sophisticated model.
+### Stage 3 (RQ2): coverage-aware LambdaMART
 
-## What actually worked, summarized honestly
+Standard LambdaRank does not optimize NDCG by writing it directly into a loss (NDCG is non-differentiable). Instead, for each pair (i, j), it computes how much a target metric would change if their ranks were swapped, and scales an ordinary pairwise gradient by that amount:
+```
+ρ_ij = 1 / (1 + exp(σ(s_i - s_j)))
+λ = σ · ρ_ij · |Δmetric|
+```
+This mechanism is metric-agnostic. RQ2 substitutes `Δcoverage@k` for the standard `ΔNDCG`. `coverage@k` is a set-membership function (a hop is covered iff any of its chunks is in the top-k), so swapping two candidates that are both inside, or both outside, the top-k provably cannot change it - only a pair straddling the rank-k boundary can. This makes `Δcoverage@k` exact and cheap to compute, and gives zero gradient to two redundant copies of an already-covered hop competing with each other.
 
-| Approach | What it's for | Result |
-|---|---|---|
-| Fine-tuned re-ranking model | Simple fact-lookup and multi-fact questions | **Strong, reliable improvement** (74%→94% top-10 hit rate) |
-| Splitting multi-fact questions into separate searches | Multi-fact questions specifically | **Strong, reliable improvement**, and the simplest fix we tried |
-| Fact-coverage-aware re-ranking model | Questions with repeated/restated facts | **Real but modest improvement** (+16%), honestly small |
-| A from-scratch attempt using a similar idea but a different math formula | Same as above | **Failed** - worse than doing nothing, a useful negative result showing the *specific* design choices mattered, not just the general idea |
+**Training**: implemented from scratch (`sklearn.tree.DecisionTreeRegressor` in a manual gradient-boosting loop - LightGBM/XGBoost require `libomp`, unavailable in this environment, and a custom objective needs gradient control those libraries don't expose). Two choices were necessary to get a result that generalizes:
+- **Warm start**: the ensemble is initialized to the stage-1 fused score, not zero, and learns only a small correction (`max_depth=2`, `min_samples_leaf=25`, `learning_rate=0.05`). An earlier, un-warm-started version with richer features memorized company-specific score patterns from the ~26 available training examples and did not transfer to new companies' filings.
+- **Feature set excludes the cross-encoder's score.** An earlier version that included it mostly learned to copy that one feature, and it doubled as a contamination path (44% of the mined training questions' gold chunks were the same chunks the cross-encoder was fine-tuned on in RQ1).
 
-We also tried a couple of more exotic ideas borrowed from academic research on "diverse search results" (explained in full in `RQ2_RESULTS.md` and `PROJECT_SUMMARY.md` for anyone who wants the deeper technical detail) - they didn't beat the simpler approach above, which is itself worth knowing before spending time on something fancier.
+| Feature | Description |
+|---|---|
+| `bm25_norm`, `dense_norm`, `cc_score` | Stage-1 signals |
+| `is_value_dup_of_higher_ranked` | Does this candidate share an extracted numeric value with a candidate already ranked above it |
+| `entity_match`, `year_match` | Detected company/year match |
+| `is_table_row` | Table row vs. narrative |
+| `lexical_overlap` | Fraction of question content words present in the candidate |
 
-## Where things stand
+## Results
 
-- The fine-tuned re-ranker (RQ1) is the strongest, most reliable part of this project.
-- Splitting multi-fact questions before searching is a simple trick that helped more than expected.
-- The repeated-fact problem (RQ2) is real and measurable, and we made modest, honest progress on it - not a solved problem.
-- Every number above was checked on questions the relevant model never saw during training, specifically to avoid fooling ourselves - see `PROJECT_SUMMARY.md` for the full discipline behind that.
+**RQ1** (185-question held-out set):
 
-## For more technical detail
+| | Recall@10 | Coverage@10 | NDCG@10 |
+|---|---|---|---|
+| Baseline (stage 1 only) | 0.738 | 0.741 | 0.522 |
+| + cross-encoder (β=1.0) | **0.942 (+27.6%)** | **0.945 (+27.5%)** | **0.842 (+61.3%)** |
 
-- [`PROJECT_SUMMARY.md`](PROJECT_SUMMARY.md) - full technical writeup tying both research questions together
-- [`RQ1_RESULTS.md`](RQ1_RESULTS.md) - the re-ranking model: architecture, training details, full results
-- [`RQ2_RESULTS.md`](RQ2_RESULTS.md) - the fact-coverage model: the math behind it, full results, and everything that didn't work
+**RQ2** (32-question redundant-hop set, 5-fold cross-validation, out-of-fold):
+
+| | Recall@10 | Coverage@10 | NDCG@5 |
+|---|---|---|---|
+| Baseline (stage 1 only) | 0.352 | 0.497 | 0.260 |
+| + coverage-aware LambdaMART | **0.438 (+24.4%)** | **0.576 (+15.9%)** | **0.331 (+27.1%)** |
+
+**Full comparison across question types** (baseline → +LambdaMART → +CE, all held-out):
+
+| Tier (n) | Baseline | +LambdaMART | +CE |
+|---|---|---|---|
+| Single-metric (139), NDCG@5 | 0.557 | 0.652 | **0.888** |
+| Multi-metric (40), NDCG@5 | 0.297 | 0.434 | **0.719** |
+| Redundant-hop (32), NDCG@5 | 0.260 | 0.331 | **0.483** |
+
+The cross-encoder is the strongest single scorer on every tier tested; LambdaMART's role is as a cheaper alternative when the cross-encoder is unavailable, not a per-question routing choice when it is (a score-blend sweep between the two, `final = β·CE + (1-β)·LambdaMART`, found pure CE (`β=1.0`) dominates monotonically on every tier, including the redundant-hop tier LambdaMART targets).
+
+### Ablation: is the coverage-specific objective load-bearing, or would any regularized booster do?
+
+A second LambdaMART was trained with identical features, warm-start, and regularization, substituting the standard `ΔNDCG@k` gradient for `Δcoverage@k`:
+
+| Tier (n) | Baseline | Coverage-aware LambdaMART | Plain NDCG-objective LambdaMART |
+|---|---|---|---|
+| Multi-metric (40), Coverage@5 | 0.348 | **0.508** | 0.171 (worse than baseline) |
+| Redundant-hop (6, held-out), Coverage@5 | 0.375 | **0.708** | 0.042 (worse than baseline) |
+
+The plain-NDCG version performs worse than no reranking at all, not merely worse than the coverage-aware version - the objective modification is load-bearing, not incidental. Interpretation: standard NDCG's gradient is denser (it fires on every pair where one candidate is more relevant and either is within the top-k), giving it more surface area to overfit given only 145 training questions; `Δcoverage@k`'s sparser, boundary-crossing-only gradient acts as an implicit regularizer.
+
+## Limitations
+
+- RQ2's effect size is modest and validated on a small pool (32 questions, roughly a dozen distinct underlying filings).
+- Stages 2 and 3 are not combined into one serving pipeline (see the score-blend result above).
+- Retrieval-metric improvements are necessary but not sufficient for end-to-end answer accuracy; no downstream LLM generation was evaluated in this environment.
+- Several additional reranking approaches were tested for the redundant-hop tier (a training-free value-similarity penalty, a submodular facility-location formulation grounded in the diversified-retrieval literature) and did not outperform the cross-encoder alone; full results in `RQ2_RESULTS.md`.
 
 ## Repository structure
 
 ```
-scripts/          the search pipeline, data preparation, model training
-eval/              the scoring code (including the "distinct facts found" metric)
-data/processed/    question sets, answer keys, generated prompts
+scripts/          retrieval pipeline, corpus construction, fine-tuning, RQ2 mining/training
+eval/              precision/recall/NDCG and coverage@k metrics
+data/processed/    question sets, gold labels, RQ2 datasets, generated prompts
 ```
