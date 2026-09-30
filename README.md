@@ -160,6 +160,28 @@ A second LambdaMART was trained with identical features, warm-start, and regular
 
 The plain-NDCG version performs worse than no reranking at all, not merely worse than the coverage-aware version - the objective modification is load-bearing, not incidental. Interpretation: standard NDCG's gradient is denser (it fires on every pair where one candidate is more relevant and either is within the top-k), giving it more surface area to overfit given only 145 training questions; `Δcoverage@k`'s sparser, boundary-crossing-only gradient acts as an implicit regularizer.
 
+## Prompt construction
+
+Retrieved chunks feed a fixed prompt template, not a raw dump of context - each retrieved chunk becomes one numbered line, prefixed with `(entity, FYyear, section_title)` so the company/year/statement a row belongs to is explicit rather than left for the model to infer from column position alone. A real, unedited example (from `data/processed/prompts/prompts_185.jsonl`, a multi-metric question retrieved at k=10):
+
+```
+Answer the question using ONLY the information in the context below, which is extracted from SEC filings (10-K/10-Q/8-K/earnings releases). Table rows list multiple years of data separated by "|" - values are ordered most-recent-fiscal-year-first, per this corpus's consistent reporting convention. If the context does not contain enough information to answer, say so explicitly rather than guessing.
+
+Retrieved evidence:
+[1] (Block, FY2020, SQUARE, INC. CONSOLIDATED BALANCE SHEETS) Goodwill | 316,701 | 266,345
+[2] (Block, FY2020, SQUARE, INC. CONSOLIDATED STATEMENTS OF OPERATIONS) Total operating expenses | 2,752,224 | 1,863,128 | 1,340,314
+[3] (Block, FY2020, Weebly, Inc.) Goodwill | 193,209
+[4] (Block, FY2020, Item 6. SELECTED FINANCIAL DATA) Total operating expenses | 2,752,224 | 1,863,128 | 1,340,314 | 893,512 | 746,491
+[5] (Block, FY2020, NOTE 8 - SALE OF ASSET GROUP) Goodwill | 4,221
+[6] (Block, FY2020, Quarterly Results of Operations) Total operating expenses | 758,507 | 745,113 | 619,815 | 628,789 | 509,701 | 467,943 | 466,688 | 418,796
+
+Question: What was Block's goodwill and total operating expenses in FY2020?
+
+Answer:
+```
+
+Note what this example itself demonstrates: retrieval correctly surfaced 6 chunks covering both requested facts, but 4 of them ([1], [3], [4], [5] for goodwill; the operating-expense rows similarly) are redundant or near-redundant restatements of the same two numbers from different sections of the filing (the main balance sheet, a subsidiary-specific note, a 5-year selected-financial-data table, a quarterly breakdown) - a concrete illustration, in an actual generated prompt, of the redundant-evidence property RQ2 addresses.
+
 ## Limitations
 
 - RQ2's effect size is modest and validated on a small pool (32 questions, roughly a dozen distinct underlying filings).
