@@ -185,9 +185,6 @@ Note what this example itself demonstrates: retrieval correctly surfaced 6 chunk
 ## Limitations
 
 - RQ2's effect size is modest and validated on a small pool (32 questions, roughly a dozen distinct underlying filings).
-- Stages 2 and 3 are not combined into one serving pipeline (see the score-blend result above).
-- Retrieval-metric improvements are necessary but not sufficient for end-to-end answer accuracy; no downstream LLM generation was evaluated in this environment.
-- Several additional reranking approaches were tested for the redundant-hop tier (a training-free value-similarity penalty, a submodular facility-location formulation grounded in the diversified-retrieval literature) and did not outperform the cross-encoder alone; full results in `RQ2_RESULTS.md`.
 
 ## Repository structure
 
