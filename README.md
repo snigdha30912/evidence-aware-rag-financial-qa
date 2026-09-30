@@ -73,14 +73,7 @@ raw_text:        Net income attributable to noncontrolling interest | $ 14 $ | 1
 
 Bundling several metric names into one query dilutes BM25/dense term-overlap scoring for each individual metric against the vocabulary of the others also present in the query. Diagnosed directly: for the multi-metric example above, the gold chunk for "cash and cash equivalents" was absent from the top 100 results when bundled with the other three metrics, but ranked #1 when queried alone.
 
-**Fix**: detect the metrics named in a question, split into one single-metric sub-question per metric, retrieve and rerank each independently, and interleave (round-robin, not concatenated) their top results into one combined ranking.
-
-| | Coverage@10 | Recall@10 |
-|---|---|---|
-| Bundled query | 0.806 | 0.806 |
-| Decomposed query | **0.969 (+20.2%)** | **0.969 (+20.2%)** |
-
-13/40 questions improved, 27 unchanged, 0 regressed (held-out multi-metric set).
+**Fix**: detect the metrics named in a question, split into one single-metric sub-question per metric, retrieve and rerank each independently, and interleave (round-robin, not concatenated) their top results into one combined ranking. Results (measured with the cross-encoder already applied on both sides, to isolate the decomposition/interleaving change itself) are reported in the RQ1 results table below, since this is a refinement on top of RQ1's reranked pipeline rather than a separate stage.
 
 ### Stage 2 (RQ1): cross-encoder reranking
 
@@ -131,6 +124,9 @@ This mechanism is metric-agnostic. RQ2 substitutes `Δcoverage@k` for the standa
 |---|---|---|---|
 | Baseline (stage 1 only) | 0.738 | 0.741 | 0.522 |
 | + cross-encoder (β=1.0) | **0.942 (+27.6%)** | **0.945 (+27.5%)** | **0.842 (+61.3%)** |
+| + query decomposition, multi-metric subset only (n=40)¹ | **0.969 (+20.2%)** | **0.969 (+20.2%)** | **0.856 (+13.8%)** |
+
+¹ Evaluated only on the 40 multi-metric questions in the 185-question set (the subset query decomposition applies to), against that same subset's bundled-query + cross-encoder numbers (recall@10=0.806, coverage@10=0.806, NDCG@10=0.753) - not against the full-set baseline row above, since the two rows use different denominators.
 
 **RQ2** (32-question redundant-hop set, 5-fold cross-validation, out-of-fold):
 
