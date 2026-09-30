@@ -19,7 +19,24 @@ Full technical writeups: [`PROJECT_SUMMARY.md`](PROJECT_SUMMARY.md), [`RQ1_RESUL
 
 ## Dataset
 
-**Corpus**: 146,821 chunks from 84 SEC filings across 32 companies (2015-2024). PDFs are converted to structured markdown via [Docling](https://github.com/docling-project/docling), then split into two chunk types: table **rows** (one row = one chunk, with entity/fiscal-year/section-title metadata attached) and narrative **paragraphs**. Row-level granularity is used for tables because the correct answer is often a single row among dozens of visually similar ones; paragraph-level granularity is used for narrative text because evidence there tends to span multiple sentences.
+**Corpus**: 146,821 chunks from 84 SEC filings across 32 companies (2015-2024). PDFs are converted to structured markdown via [Docling](https://github.com/docling-project/docling), then split into two chunk types: table **rows** (one row = one chunk) and narrative **paragraphs**. Row-level granularity is used for tables because the correct answer is often a single row among dozens of visually similar ones; paragraph-level granularity is used for narrative text because evidence there tends to span multiple sentences.
+
+**What a chunk actually contains**: each chunk is a record with a stable ID, a pointer to its parent, and metadata alongside the text itself - not just a raw string. A real table-row chunk from 3M's FY2018 10-K looks like:
+
+```
+chunk_id:        3M_2018_10K__block188__row0
+parent_id:       3M_2018_10K__block188
+chunk_type:      table_row
+entity:          3M
+fiscal_period:   2018
+section_title:   Net Income Attributable to Noncontrolling Interest:
+subsection_title: (Millions) | 2018 | 2017 | 2016     <- the table's column headers
+raw_text:        Net income attributable to noncontrolling interest | $ 14 $ | 11 | $ 8
+```
+
+**Parent-child indexing**: every row cut from the same source table shares one `parent_id` (the ID of that table as a whole), while each row gets its own `chunk_id`. Retrieval and reranking only ever operate on the row-level `chunk_id`s - the `parent_id` isn't used to widen what gets retrieved, but it does mean any row can be traced back to the exact table it came from, which is how the corpus's whole-table lookup view (`data/processed/coarse_chunks.parquet`) is built without re-parsing anything.
+
+**Contextual chunks (why `raw_text` alone isn't what gets indexed)**: `raw_text` for a table row is just the row itself and doesn't repeat the company name or year - a row can say `$ 14 $ | 11 | $ 8` with no company mentioned at all. Indexed and embedded in isolation, that row would be retrievable for the wrong company's question just as easily as the right one. To fix this, both the BM25 index and the dense embeddings are built over `f"{entity}, FY{fiscal_period}, {section_title}: {raw_text}"` instead of `raw_text` alone - so the example chunk above is actually indexed as `"3M, FY2018, Net Income Attributable to Noncontrolling Interest:: Net income attributable to noncontrolling interest | $ 14 $ | 11 | $ 8"`. This gives every chunk's own text a chance to match a question's company/year mention, on top of the separate regex-based entity/year filtering described below.
 
 **"Hop" and "hop size"** - two independent properties used to describe a question. A **hop** is one distinct fact the question needs (a question needing revenue and total assets has 2 hops). **Hop size** is how many chunks in the corpus contain that fact - hop size 1 means the fact appears in exactly one place; hop size 2+ means it's restated in more than one chunk (e.g. the same net income figure reported in both an earnings release and the subsequent 10-K). `coverage@k` and `recall@k` are mathematically identical whenever every hop has size 1; they diverge only on redundant-hop questions, which is the subject of RQ2.
 
@@ -42,7 +59,15 @@ Full technical writeups: [`PROJECT_SUMMARY.md`](PROJECT_SUMMARY.md), [`RQ1_RESUL
 - Sparse: BM25 (`bm25s`), NLTK's 198-word stopword list, each chunk's text prefixed with `entity, FYyear, section_title:`.
 - Dense: `sentence-transformers/all-mpnet-base-v2` embeddings (off-the-shelf, not fine-tuned), cosine similarity.
 - Entity/year filtering: regex-based company and fiscal-year detection restricts candidates to the detected company/year.
-- Fusion: convex combination of min-max normalized scores, `score = α · bm25_norm + (1-α) · dense_norm`, `α=0.4` (found by sweep; outperforms BM25 alone, dense alone, and reciprocal rank fusion).
+- **Fusion**: BM25 and cosine similarity scores are on different, incomparable scales (BM25 is an unbounded term-weighting score; cosine similarity is bounded in [-1, 1]), so they can't be combined directly - a method with naturally larger numbers would dominate the sum regardless of which one is actually more informative. Both are first min-max normalized to a shared [0, 1] scale within their own ranked list:
+  ```
+  norm(s) = (s - min(scores)) / (max(scores) - min(scores))
+  ```
+  and then combined as a **convex combination** - a weighted sum whose weights are non-negative and sum to 1, so the result is guaranteed to stay within the range of its inputs rather than overshooting either one:
+  ```
+  score = α · bm25_norm + (1-α) · dense_norm,   α=0.4
+  ```
+  `α=0.4` was found by sweeping α and evaluating recall@10; this fusion outperforms BM25 alone, dense alone, and reciprocal rank fusion (an alternative, rank-based fusion method) on this corpus.
 
 ### Query decomposition for multi-metric questions
 
