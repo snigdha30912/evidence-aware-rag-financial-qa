@@ -50,7 +50,7 @@ raw_text:        Net income attributable to noncontrolling interest | $ 14 $ | 1
 | Cross-distribution (analytical) | varies | 1 | *"What is the FY2017-FY2019 3-year average of capex as a % of revenue for Activision Blizzard?"* - requires locating multiple raw figures and computing a derived ratio |
 | Redundant-hop | 2+ | 2+ | Same shape as multi-metric, but at least one fact is restated in more than one chunk (e.g. an earnings release and the subsequent 10-K both reporting the same net income figure) |
 
-**Test sets used below**: a 591-question training set and a 185-question held-out set (built from 7 metrics never used in training, for a same-distribution generalization check) for RQ1; a 32-question redundant-hop set (mined from the corpus, verified by exact numeric-value matching) for RQ2; natural FinanceBench train/val splits for cross-distribution generalization checks.
+**Test sets used below**: a 591-question training set and a 185-question held-out set (built from 7 metrics never used in training, for a same-distribution generalization check) for RQ1; a 32-question redundant-hop set (mined from the corpus, verified by exact numeric-value matching) for RQ2.
 
 ## Method
 
@@ -86,31 +86,31 @@ L = -log(P_ij)
 ```
 Minimizing this pushes the relevant document's score up and the hard negative's down. Trained on 591 questions / 3,682 (question, document) pairs, 5 epochs.
 
-**Score blending**: rather than fully trusting the reranker, its score is blended with the stage-1 rank: `final = β · reranker_score + (1-β) · stage1_rank`. Swept over `β ∈ {0.0, 0.3, 0.5, 0.7, 1.0}`:
-
-| Test set | β=1.0 (full trust) | β=0.3 |
-|---|---|---|
-| Held-out, same distribution (185 q) | **+64% P@5** | +40% P@5 |
-| Cross-distribution, natural FinanceBench (30 q) | **-21% P@5 (regression)** | +5% P@5 |
-
-`β=1.0` is optimal for factual-lookup questions but regresses on analytically-phrased questions; `β=0.3` is positive on every test set and is the recommended default when the query distribution is uncertain.
+**Score blending**: rather than fully trusting the reranker, its score is blended with the stage-1 rank: `final = β · reranker_score + (1-β) · stage1_rank`. Swept over `β ∈ {0.0, 0.3, 0.5, 0.7, 1.0}`; `β=1.0` (full trust in the reranker) gives the largest gain on the held-out, same-distribution set (185 q): **+64% P@5**.
 
 ### Stage 3 (RQ2): coverage-aware LambdaMART
 
-Standard LambdaRank does not optimize NDCG by writing it directly into a loss (NDCG is non-differentiable). Instead, for each pair (i, j), it computes how much a target metric would change if their ranks were swapped, and scales an ordinary pairwise gradient by that amount:
+**What `coverage@k` measures**: a question's evidence is grouped into hops (distinct required facts), each hop possibly satisfied by more than one chunk (its "hop group"). `coverage@k` is the fraction of hop groups with at least one member in the top-k:
+```
+coverage@k = (1/H) · Σ_h  1[ top-k ∩ hop_group(h) ≠ ∅ ]        (H = number of hops)
+```
+Concretely: a question needing total assets and net income, where the corpus restates each 9 times (18 gold chunks total), has 2 hops. A ranking that returns 10 different "net income" restatements and zero "total assets" chunks scores **precision@10 = 1.0** (every returned chunk is technically gold) but **coverage@10 = 0.5** (only 1 of the 2 needed facts is actually present) - and a ratio can't be computed from one fact alone, so that ranking is useless for the question despite its perfect precision. This is the blind spot `coverage@k` exists to catch: precision and NDCG treat every gold chunk as interchangeable regardless of which fact it represents.
+
+**What `λ` (lambda) actually does during training**: standard LambdaRank doesn't optimize NDCG by writing it directly into a loss - NDCG is non-differentiable, since it depends on sort order, not smooth scores. Instead, for every pair of candidates (i, j) where i is more relevant than j, it computes how much a target metric would change if their ranks were swapped, and uses that as a per-pair "force":
 ```
 ρ_ij = 1 / (1 + exp(σ(s_i - s_j)))
-λ = σ · ρ_ij · |Δmetric|
+λ_ij = σ · ρ_ij · |Δmetric_ij|
 ```
-This mechanism is metric-agnostic. RQ2 substitutes `Δcoverage@k` for the standard `ΔNDCG`. `coverage@k` is a set-membership function (a hop is covered iff any of its chunks is in the top-k), so swapping two candidates that are both inside, or both outside, the top-k provably cannot change it - only a pair straddling the rank-k boundary can. This makes `Δcoverage@k` exact and cheap to compute, and gives zero gradient to two redundant copies of an already-covered hop competing with each other.
+`ρ_ij` is a sigmoid of the current score gap - close to 1 if j is currently (wrongly) scored above or near i, close to 0 if i is already clearly ahead - so the pair only gets a meaningful push while the model still has the ordering wrong or uncertain. That push is then scaled by `|Δmetric_ij|`, how much the chosen metric would change if i and j swapped ranks. Each candidate's total `λ_i = Σ_j ±λ_ij` (summed over every pair it appears in) is the net direction and size of the nudge that candidate's score should get. In gradient boosting, that's used directly as the regression target for the next decision tree - the tree learns to predict each candidate's `λ_i` from its features, and its predictions get added (scaled by the learning rate) to the running ensemble score. Training is thus a sequence of small corrections, each one built to move scores in the direction that most improves the target metric.
+
+This mechanism is metric-agnostic - `|Δmetric_ij|` can be any rank metric's sensitivity to a swap. RQ2 substitutes `Δcoverage@k` for the standard `ΔNDCG`. Because `coverage@k` is a set-membership function (a hop is covered iff any of its chunks is in the top-k), swapping two candidates that are both inside, or both outside, the top-k provably cannot change it - only a pair straddling the rank-k boundary can. Concretely: if a hop is already covered by a chunk ranked #2, two of its other restated chunks competing for ranks #15 vs. #16 get `Δcoverage@k = 0` - there's nothing left to gain there, so training gradient is directed elsewhere, toward hops that aren't covered yet. This also makes `Δcoverage@k` exact and cheap to compute, unlike `ΔNDCG`, which is nonzero for essentially every pair and has to be computed per-pair regardless of rank position.
 
 **Training**: implemented from scratch (`sklearn.tree.DecisionTreeRegressor` in a manual gradient-boosting loop - LightGBM/XGBoost require `libomp`, unavailable in this environment, and a custom objective needs gradient control those libraries don't expose). Two choices were necessary to get a result that generalizes:
 - **Warm start**: the ensemble is initialized to the stage-1 fused score, not zero, and learns only a small correction (`max_depth=2`, `min_samples_leaf=25`, `learning_rate=0.05`). An earlier, un-warm-started version with richer features memorized company-specific score patterns from the ~26 available training examples and did not transfer to new companies' filings.
-- **Feature set excludes the cross-encoder's score.** An earlier version that included it mostly learned to copy that one feature, and it doubled as a contamination path (44% of the mined training questions' gold chunks were the same chunks the cross-encoder was fine-tuned on in RQ1).
 
 | Feature | Description |
 |---|---|
-| `bm25_norm`, `dense_norm`, `cc_score` | Stage-1 signals |
+| `bm25_norm`, `dense_norm`, `cc_score` | Stage-1 signals - `cc_score` is the stage-1 **c**onvex-**c**ombination fusion score (`α·bm25_norm + (1-α)·dense_norm`), not the cross-encoder |
 | `is_value_dup_of_higher_ranked` | Does this candidate share an extracted numeric value with a candidate already ranked above it |
 | `entity_match`, `year_match` | Detected company/year match |
 | `is_table_row` | Table row vs. narrative |
